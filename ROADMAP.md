@@ -4,7 +4,7 @@
 
 - Home, Library, Settings, onboarding, tool details, and standalone offline lessons.
 - 39 tools across six categories, each with a complete multi-step lesson, grip and target-angle coaching, safety tips, and warnings.
-- Bespoke solid 3D geometry for every tool, drawn by a shared offline renderer with per-technique animation, drag orbit, and per-step camera framing.
+- Bespoke solid 3D geometry for every tool, drawn by a shared offline renderer with per-technique animation, stroke rhythms that hold at each extreme, material-aware rim-lit shading, depth falloff, a contact shadow that follows the gesture, drag orbit, and per-step camera framing.
 - Favorites, recent tools, resume progress, completion, and reduced-motion preference.
 - Search/category filtering, reset filters, storage-error feedback, and learning reset.
 - Searchable, category-grouped manual picker for the tools the camera cannot name.
@@ -14,7 +14,7 @@
 
 ## Model work — the artifact ships, the coverage does not
 
-The bundled SSD MobileNet V1 / COCO model is real and loads; what is missing is class coverage. It maps only `knife` and `bowl`, so 2 of 39 tools are scannable and the rest open from the library. The remaining work is coverage and validation, not producing a model.
+The bundled SSD MobileNet V1 / COCO model is real and loads; what is missing is class coverage. It maps `knife`, `bowl`, and `scissors` → `kitchen_shears`, so 3 of 39 tools are scannable and the rest open from the library. The remaining work is coverage and validation, not producing a model.
 
 1. Collect licensed images for the tools to be scannable, plus unrelated objects and empty scenes.
 2. Split training/validation/test data by physical tool and capture session to avoid near-duplicate leakage.

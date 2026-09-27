@@ -2,13 +2,15 @@ import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../models/tool_model.dart';
 import '../services/detector.dart';
 import '../services/detection_gate.dart';
 import '../services/frame_preprocessor.dart';
 import '../services/tool_catalog.dart';
-import '../widgets/tool_artwork.dart';
+import '../services/learning_store.dart';
+import '../widgets/tutorial_3d_painter.dart';
 import 'tutorial_screen.dart';
 
 class ScannerScreen extends StatefulWidget {
@@ -27,7 +29,17 @@ class _ScannerScreenState extends State<ScannerScreen>
   late final ToolDetector _detector;
   final DetectionGate _gate = DetectionGate(requiredConsecutiveMatches: 3);
 
+  /// Moderated-confidence tracker. A real knife or pair of shears often scores
+  /// 0.4–0.65 on this model, so demanding 0.65 on every frame misses it
+  /// entirely. This gate watches the lower band and, when a tool is seen
+  /// consistently, offers it as a *proposal* the user confirms. It can never
+  /// open a lesson on its own, so a false positive still costs one tap.
+  final DetectionGate _proposalGate = DetectionGate(
+      requiredConsecutiveMatches: 5,
+      minConfidence: ToolDetector.candidateFloor);
+
   bool _torchOn = false;
+  int _darkFrames = 0;
   bool _choosingTool = false;
   bool _isCameraReady = false;
   bool _isCameraBusy = false;
@@ -43,6 +55,10 @@ class _ScannerScreenState extends State<ScannerScreen>
   // Detection & Tutorial states
   String _hudStatusMessage = "Position tool inside frame";
   ToolModel? _activeTool;
+  bool _lessonRequested = false;
+  bool _proposalMatch = false;
+  double _matchConfidence = 0;
+  ToolModel? _streakCandidate;
 
   @override
   void initState() {
@@ -93,7 +109,7 @@ class _ScannerScreenState extends State<ScannerScreen>
       _isCameraBusy = true;
       _cameraErrorMessage = null;
       _openSettings = false;
-      _gate.reset();
+      _resetDetection();
       _lastFrameAt = null;
       _torchOn = false;
       _hudStatusMessage = 'Starting camera...';
@@ -162,6 +178,18 @@ class _ScannerScreenState extends State<ScannerScreen>
     }
   }
 
+  /// Clears both streak trackers and their HUD state. Every path that returns
+  /// the camera to searching goes through here, so the two gates can never
+  /// drift apart.
+  void _resetDetection() {
+    _gate.reset();
+    _proposalGate.reset();
+    _streakCandidate = null;
+    _darkFrames = 0;
+    _proposalMatch = false;
+    _matchConfidence = 0;
+  }
+
   Future<void> _disposeCameraOnly() async {
     if (_cameraController != null) {
       final old = _cameraController!;
@@ -206,8 +234,14 @@ class _ScannerScreenState extends State<ScannerScreen>
       }
 
       final now = DateTime.now();
-      if (_lastFrameAt != null &&
-          now.difference(_lastFrameAt!) < const Duration(milliseconds: 250)) {
+      // While a match streak is building, sample faster so the three frames
+      // that confirm a tool land in quick succession; back off when idle so
+      // searching does not burn battery.
+      final cadence = (_gate.currentCount > 0 ||
+              _proposalGate.currentCount > 0)
+          ? const Duration(milliseconds: 180)
+          : const Duration(milliseconds: 250);
+      if (_lastFrameAt != null && now.difference(_lastFrameAt!) < cadence) {
         return;
       }
       _lastFrameAt = now;
@@ -227,22 +261,83 @@ class _ScannerScreenState extends State<ScannerScreen>
           return;
         }
 
+        // Sustained darkness is a lighting problem, not a scanning problem:
+        // turn the torch on automatically so the user does not have to find
+        // the button in the dark. Reset whenever frames become readable.
+        if (result.autoTorchRecommended) {
+          _darkFrames++;
+          if (_darkFrames == 3 && !_torchOn) await _toggleTorch();
+        } else {
+          _darkFrames = 0;
+        }
+
+        // A first lock on a candidate is worth a quiet tick: the user learns
+        // the tool is being tracked without looking at the HUD.
+        if (_gate.currentCount == 0 &&
+            _proposalGate.currentCount == 0 &&
+            result.tool != null) {
+          HapticFeedback.selectionClick();
+        }
+
         final confirmed = _gate.feed(result);
+        // Only one gate advances per frame: a strong streak does not also pad
+        // the proposal streak, so a confirmed match can never look like a
+        // proposal (or the other way around).
+        final proposed =
+            confirmed == null ? _proposalGate.feed(result) : null;
+        // Name the tool the streak is building on so the HUD answers
+        // 'what does it see?' while the confirmation counts up.
+        _streakCandidate = result.tool;
         setState(() => _hudStatusMessage = result.statusMessage);
-        if (confirmed != null) {
+        final matched = confirmed ?? proposed;
+        if (matched != null) {
+          HapticFeedback.mediumImpact();
+          // Latch _activeTool FIRST so a second queued frame can't also confirm.
           setState(() {
-            _activeTool = confirmed;
-            _hudStatusMessage = "Confirmed: ${confirmed.name}!";
+            _activeTool = matched;
+            _lessonRequested = false;
+            _proposalMatch = confirmed == null;
+            _matchConfidence = result.confidence;
+            _hudStatusMessage = "Confirmed: ${matched.name}!";
           });
           if (_cameraController != null &&
               _cameraController!.value.isStreamingImages) {
             await _cameraController!.stopImageStream();
           }
+          // Stay on the scanner: the animated 3D preview card lets the user
+          // verify the match before committing to the lesson. A wrong match is
+          // one tap to reject; a right one starts the lesson from the card.
         }
       } catch (_) {
-        _gate.reset();
+        _resetDetection();
       } finally {
         _isProcessingFrame = false;
+      }
+    });
+  }
+
+  /// Opens the lesson from an auto-detection. Uses [Navigator.push] so the
+  /// scanner remains underneath and we can resume the detection loop on return.
+  Future<void> _openLessonFromDetection(ToolModel tool) async {
+    _lessonRequested = true;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => TutorialScreen(tool: tool)),
+    );
+    // Resume scanning when the lesson is popped.
+    if (!mounted) return;
+    setState(() {
+      _activeTool = null;
+      _lessonRequested = false;
+      _resetDetection();
+      _hudStatusMessage = "Position tool inside frame";
+    });
+    _startDetectionLoop().catchError((Object error) {
+      if (mounted) {
+        setState(() {
+          _cameraErrorMessage = 'Unable to start scanning. Retry the camera.';
+          _isCameraReady = false;
+        });
       }
     });
   }
@@ -258,7 +353,7 @@ class _ScannerScreenState extends State<ScannerScreen>
         state == AppLifecycleState.hidden) {
       _foreground = false;
       ++_cameraGeneration;
-      _gate.reset();
+      _resetDetection();
       _cameraWork = _cameraWork.then((_) => _disposeCameraOnly());
       if (mounted) setState(() => _isCameraReady = false);
     }
@@ -276,7 +371,7 @@ class _ScannerScreenState extends State<ScannerScreen>
 
   Future<void> _chooseTool() async {
     _choosingTool = true;
-    _gate.reset();
+    _resetDetection();
     final tool = await showModalBottomSheet<ToolModel>(
       context: context,
       isScrollControlled: true,
@@ -290,24 +385,6 @@ class _ScannerScreenState extends State<ScannerScreen>
   void _openLesson(ToolModel tool) {
     Navigator.pushReplacement(
         context, MaterialPageRoute(builder: (_) => TutorialScreen(tool: tool)));
-  }
-
-  void _scanAgain() {
-    setState(() {
-      _activeTool = null;
-      _gate.reset();
-      _hudStatusMessage = "Position tool inside frame";
-    });
-    if (_cameraController != null && _cameraController!.value.isInitialized) {
-      _startDetectionLoop().catchError((Object error) {
-        if (mounted) {
-          setState(() {
-            _cameraErrorMessage = 'Unable to start scanning. Retry the camera.';
-            _isCameraReady = false;
-          });
-        }
-      });
-    }
   }
 
   @override
@@ -331,13 +408,6 @@ class _ScannerScreenState extends State<ScannerScreen>
               onPressed: _chooseTool,
               tooltip: 'Choose tool manually',
               icon: const Icon(Icons.list_alt)),
-          if (_activeTool != null)
-            TextButton.icon(
-              onPressed: _scanAgain,
-              icon: const Icon(Icons.refresh, color: Colors.amber, size: 18),
-              label: const Text("Scan Again",
-                  style: TextStyle(color: Colors.amber)),
-            ),
         ],
       ),
       body: Stack(
@@ -352,11 +422,106 @@ class _ScannerScreenState extends State<ScannerScreen>
           if (_activeTool == null && _isCameraReady && _detector.isLoaded)
             _buildScanningReticle(),
 
-          // 3. 3D Tutorial Overlay (when tool is recognized)
-          if (_activeTool != null) _buildTutorialOverlay(),
+          // 3. Recognition preview: the confirmed tool, animated in 3D, so the
+          // match can be verified before the lesson opens.
+          if (_activeTool != null && !_lessonRequested)
+            Positioned(
+                left: 16,
+                right: 16,
+                bottom: 16,
+                child: SafeArea(child: _buildRecognitionCard(_activeTool!))),
         ],
       ),
     );
+  }
+
+  /// The 'is this your tool?' card. Runs the same animated 3D demonstration as
+  /// the lesson view, so what the user verifies is what they are about to learn
+  /// with. Rejecting re-arms the detection loop immediately.
+  Widget _buildRecognitionCard(ToolModel tool) {
+    final motionAllowed = !MediaQuery.disableAnimationsOf(context) &&
+        !LearningScope.of(context).reduceMotion;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+          color: const Color(0xFF162937).withValues(alpha: .97),
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(color: const Color(0xFF3D5B4C))),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Semantics(
+          label: 'Recognized ${tool.name}, animated illustration',
+          child: Container(
+            height: 220,
+            clipBehavior: Clip.antiAlias,
+            decoration: BoxDecoration(
+                color: const Color(0xFF0F1D28),
+                borderRadius: BorderRadius.circular(18)),
+            child: FittedBox(
+              child: SizedBox(
+                width: 380,
+                height: 320,
+                child: Tutorial3DView(
+                    tool: tool, stepIndex: 0, isPlaying: motionAllowed),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Text(_proposalMatch ? 'POSSIBLE MATCH' : 'RECOGNIZED',
+            style: TextStyle(
+                fontSize: 11,
+                letterSpacing: 1.6,
+                color: _proposalMatch
+                    ? const Color(0xFFFFC66D)
+                    : const Color(0xFF8AD4B0),
+                fontWeight: FontWeight.w700)),
+        const SizedBox(height: 4),
+        Text('Is this your ${tool.name}?',
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 4),
+        Text(
+            _proposalMatch
+                ? '${(_matchConfidence * 100).round()}% confidence — please '
+                    'check it is the right tool.'
+                : '${(_matchConfidence * 100).round()}% confidence — always '
+                    'check before starting.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                fontSize: 12, color: Colors.white.withValues(alpha: .55))),
+        const SizedBox(height: 12),
+        Row(children: [
+          Expanded(
+            child: OutlinedButton(
+                onPressed: _rejectMatch,
+                style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white70,
+                    side: const BorderSide(color: Colors.white24)),
+                child: const Text('Not this tool')),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            flex: 2,
+            child: FilledButton.icon(
+                onPressed: () => _openLessonFromDetection(tool),
+                icon: const Icon(Icons.play_arrow_rounded),
+                label: const Text('Start lesson')),
+          ),
+        ]),
+      ]),
+    );
+  }
+
+  /// Clears the confirmation and puts the camera back to work. A wrong match
+  /// should cost one tap, not a trip through the picker.
+  Future<void> _rejectMatch() async {
+    setState(() {
+      _activeTool = null;
+      _lessonRequested = false;
+      _resetDetection();
+      _hudStatusMessage = 'Position tool inside frame';
+    });
+    await _startDetectionLoop();
   }
 
   Widget _buildCameraFallback() {
@@ -457,11 +622,25 @@ class _ScannerScreenState extends State<ScannerScreen>
           child: AspectRatio(
               aspectRatio: 1,
               child: IgnorePointer(
-                child: Container(
+                child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 250),
+                    curve: Curves.easeOut,
                     decoration: BoxDecoration(
                         border: Border.all(
-                            color: const Color(0xFFFFC66D), width: 2),
-                        borderRadius: BorderRadius.circular(24))),
+                            color: _gate.currentCount > 0
+                                ? const Color(0xFF8AD4B0)
+                                : const Color(0xFFFFC66D),
+                            width: _gate.currentCount > 0 ? 3 : 2),
+                        borderRadius: BorderRadius.circular(24),
+                        boxShadow: _gate.currentCount > 0
+                            ? [
+                                BoxShadow(
+                                    color: const Color(0xFF8AD4B0).withValues(
+                                        alpha: .18 + .10 * _gate.currentCount),
+                                    blurRadius: 18,
+                                    spreadRadius: 2)
+                              ]
+                            : null)),
               )),
         )),
         Positioned(
@@ -493,19 +672,38 @@ class _ScannerScreenState extends State<ScannerScreen>
                   color: Colors.black87,
                   borderRadius: BorderRadius.circular(18)),
               child: Column(mainAxisSize: MainAxisSize.min, children: [
-                const Text('Hold one tool steady in the frame.',
-                    textAlign: TextAlign.center),
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 180),
+                  child: _gate.currentCount > 0
+                      ? Text(
+                          'Keep the ${_streakCandidate?.name ?? 'tool'} steady '
+                              '— match ${_gate.currentCount} of '
+                              '${_gate.requiredConsecutiveMatches}',
+                          key: const ValueKey('streak'),
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                              color: Color(0xFFFFC66D),
+                              fontWeight: FontWeight.w700))
+                      : const Text('Hold one tool steady in the frame.',
+                          key: ValueKey('idle'),
+                          textAlign: TextAlign.center),
+                ),
                 const SizedBox(height: 6),
                 Text(ToolDetector.recognitionScopeNotice,
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                         fontSize: 12, color: Color(0xFF9BB0BD))),
                 const SizedBox(height: 10),
-                LinearProgressIndicator(
-                    value: _gate.progress,
-                    semanticsLabel: 'Recognition confirmation',
-                    minHeight: 5,
-                    borderRadius: BorderRadius.circular(8)),
+                TweenAnimationBuilder<double>(
+                  tween: Tween(begin: 0, end: _gate.progress),
+                  duration: const Duration(milliseconds: 200),
+                  curve: Curves.easeOut,
+                  builder: (context, value, _) => LinearProgressIndicator(
+                      value: value,
+                      semanticsLabel: 'Recognition confirmation',
+                      minHeight: 5,
+                      borderRadius: BorderRadius.circular(8)),
+                ),
                 TextButton.icon(
                     onPressed: _chooseTool,
                     icon: const Icon(Icons.list_alt),
@@ -515,44 +713,8 @@ class _ScannerScreenState extends State<ScannerScreen>
       ]),
     ));
   }
-
-  Widget _buildTutorialOverlay() {
-    final tool = _activeTool!;
-    return Positioned.fill(
-      child: ColoredBox(
-        color: const Color(0xFF0C1922),
-        child: SafeArea(
-          child: ListView(padding: const EdgeInsets.all(24), children: [
-            const Icon(Icons.check_circle_outline,
-                color: Color(0xFF8AD4B0), size: 40),
-            const SizedBox(height: 16),
-            Text('Is this your tool?',
-                style: Theme.of(context).textTheme.headlineMedium),
-            const SizedBox(height: 12),
-            const Text('Check the result before starting your lesson.',
-                style: TextStyle(color: Color(0xFFB8C7D0))),
-            const SizedBox(height: 24),
-            ToolArtwork(tool: tool, height: 240),
-            const SizedBox(height: 20),
-            Text(tool.name, style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(height: 8),
-            Text(tool.description),
-            const SizedBox(height: 24),
-            FilledButton.icon(
-                onPressed: () => _openLesson(tool),
-                icon: const Icon(Icons.play_arrow),
-                label: const Text('Yes, start lesson')),
-            const SizedBox(height: 12),
-            OutlinedButton(
-                onPressed: _chooseTool,
-                child: const Text('Choose a different tool')),
-            TextButton(onPressed: _scanAgain, child: const Text('Scan again')),
-          ]),
-        ),
-      ),
-    );
-  }
 }
+
 
 /// Manual picker for the tools the bundled model cannot name.
 ///

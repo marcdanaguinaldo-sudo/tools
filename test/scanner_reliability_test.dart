@@ -42,6 +42,35 @@ void main() {
         throwsArgumentError);
   });
 
+  test('a proposal gate can surface a match the strict gate would refuse',
+      () {
+    // Five steady frames in the moderated band (0.40–0.65) surface the tool as
+    // a proposal. It still has to be accepted by a human, and the strict gate
+    // on the same frames stays silent — so nothing is being loosened.
+    final proposal =
+        DetectionGate(requiredConsecutiveMatches: 5, minConfidence: .40);
+    for (var i = 0; i < 4; i++) {
+      expect(proposal.feed(detected(knife, .5)), isNull);
+    }
+    expect(proposal.feed(detected(knife, .5)), knife);
+
+    final strict = DetectionGate();
+    for (var i = 0; i < 3; i++) {
+      expect(strict.feed(detected(knife, .64)), isNull);
+      expect(strict.currentCount, 0);
+    }
+
+    // Below the proposal floor there is no signal at all.
+    final quiet =
+        DetectionGate(requiredConsecutiveMatches: 2, minConfidence: .40);
+    expect(quiet.feed(detected(knife, .2)), isNull);
+    expect(quiet.currentCount, 0);
+
+    // A nonsensical floor is rejected rather than silently clamped.
+    expect(() => DetectionGate(minConfidence: 0), throwsArgumentError);
+    expect(() => DetectionGate(minConfidence: double.nan), throwsArgumentError);
+  });
+
   test('tool metadata stays compatible without leaking model internals', () {
     expect(kBuiltInTools.first.classId, isNotNull);
     expect(ToolDetector.supportedToolsMessage, isNot(contains('Experimental')));
@@ -69,6 +98,36 @@ void main() {
           isFalse);
       expect(detected(knife, score).isRecognized, isFalse);
     }
+  });
+
+  test('sub-threshold and off-center detections guide instead of dead-ending',
+      () {
+    // Below the confirm threshold but inside the guide: name what it likely
+    // sees and ask for steadiness. Never confirmable.
+    final low = ToolDetector.selectDetection([0], [.52], 1, ['knife']);
+    expect(low.isRecognized, isFalse);
+    expect(low.statusMessage.toLowerCase(), contains('knife'));
+    expect(low.statusMessage, contains('steady'));
+
+    // Confident but outside the center guide: ask for re-centering.
+    final off = ToolDetector.selectDetection([0], [.9], 1, ['knife'],
+        boxes: [
+          [0, 0, .1, .1]
+        ]);
+    expect(off.isRecognized, isFalse);
+    expect(off.statusMessage.toLowerCase(), contains('center'));
+
+    // Common kitchen classes without a lesson are named honestly, never
+    // aliased to a lesson.
+    final spoon = ToolDetector.selectDetection([0], [.8], 1, ['spoon']);
+    expect(spoon.isRecognized, isFalse);
+    expect(spoon.statusMessage, contains('Spoon'));
+    expect(spoon.statusMessage, contains('library'));
+
+    // Far below the candidate floor stays a plain no-match.
+    final faint = ToolDetector.selectDetection([0], [.2], 1, ['knife']);
+    expect(faint.isRecognized, isFalse);
+    expect(faint.statusMessage, ToolDetector.noMatchMessage);
   });
 
   test('placeholder model stays unavailable without native inference',

@@ -281,6 +281,26 @@ class _Part {
   final double amount;
 }
 
+/// One technique stroke as it is actually demonstrated.
+///
+/// A raw sine passes through the middle of a swing at full speed and reverses
+/// instantly at each end, which reads as a metronome. Three animation
+/// principles fix that, all periodic so a looping lesson never shows a seam:
+///
+/// * **Ease and dwell.** A sine maps to 0..1, a smoothstep of that slows into
+///   both ends, and the remap returns it to -1..1 so every existing stroke
+///   amount keeps its sign. The gesture holds at its extreme for a beat.
+/// * **Anticipation.** A second harmonic, a quarter cycle ahead, dips the part
+///   slightly *against* the stroke before it starts — the wind-up before a
+///   cut or a press.
+/// * **Follow-through.** That same harmonic carries the part slightly past the
+///   extreme on the way back, so it overshoots rather than stopping dead.
+double _strokeWave(double phase) {
+  final s = .5 + .5 * math.sin(phase);
+  final dwell = (s * s * (3 - 2 * s)) * 2 - 1;
+  return dwell - .10 * math.sin(2 * phase);
+}
+
 /// Turns [p] by [turn] about [pivot] so a moving part articulates from its own
 /// joint rather than spinning around the world origin.
 _V _about(_V p, Offset pivot, _V Function(_V) turn) {
@@ -306,7 +326,7 @@ List<_V> _pose(List<_V> vertices, _Part part, double t) {
         for (final p in vertices) p.add(_V(0, distance * part.amount, 0)),
       ];
 
-  final wave = math.sin(phase);
+  final wave = _strokeWave(phase);
   switch (part.anim) {
     case _Anim.none:
       return vertices;
@@ -420,16 +440,13 @@ class ToolGeometry {
     required double zoom,
     int stepIndex = 0,
     bool showCallouts = false,
-    bool showStage = false,
-  }) {
+    bool showStage = false,    }) {
     final parts = _parts[toolId] ?? _parts['knife']!;
     if (parts.isEmpty) return;
 
     // Frame the tool from its own bounds so every mesh in the catalogue sits
     // well in frame regardless of how it was authored. The bounds come from the
-    // resting pose on purpose: re-fitting every animated frame would recentre
-    // the camera onto the moving part and quietly cancel out every stroke that
-    // works by translating (bob, lift).
+    // resting pose (no rotation) so the tool never breathes as the camera orbits.
     var minX = double.infinity;
     var maxX = double.negativeInfinity;
     var minY = double.infinity;
@@ -437,11 +454,10 @@ class ToolGeometry {
     for (final part in parts) {
       for (final face in part.mesh.faces) {
         for (final p in _pose(face.points, part, 0)) {
-          final turned = p.rotateX(rotX).rotateY(rotY);
-          if (turned.x < minX) minX = turned.x;
-          if (turned.x > maxX) maxX = turned.x;
-          if (turned.y < minY) minY = turned.y;
-          if (turned.y > maxY) maxY = turned.y;
+          if (p.x < minX) minX = p.x;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.y > maxY) maxY = p.y;
         }
       }
     }
@@ -454,8 +470,6 @@ class ToolGeometry {
 
     final origin = Offset(size.width / 2, size.height / 2);
     final unit = (math.min(size.width, size.height) * .40 * zoom) / extent;
-    // A shallow tilt so the model reads as a solid rather than a flat card.
-    final floor = origin.dy + math.min(size.width, size.height) * .34;
 
     Offset project(_V p) {
       final z = p.z;
@@ -464,37 +478,110 @@ class ToolGeometry {
           origin.dy - (p.y - midY) * unit * k);
     }
 
-    if (showStage) _drawStage(canvas, size, origin, floor);
-
+    // Build the drawable list first so we can compute the true projected bounds
+    // for a directional cast shadow.
     final length = math
         .sqrt(_light.x * _light.x + _light.y * _light.y + _light.z * _light.z);
     final lx = _light.x / length;
     final ly = _light.y / length;
     final lz = _light.z / length;
 
+    // Half-vector for the specular highlight: light plus the view direction,
+    // which always points down -z once the face has survived back-face culling.
+    final hmag = math.sqrt(lx * lx + ly * ly + (lz + 1) * (lz + 1));
+
+    // One shared pulse so every moving part breathes in step.
+    final pulse = .5 + .5 * math.sin(2 * math.pi * anim);
+
     final drawable = <_Drawable>[];
+    var projMinX = double.infinity;
+    var projMaxX = double.negativeInfinity;
+    var projMaxY = double.negativeInfinity;
     for (var i = 0; i < parts.length; i++) {
       for (final face in parts[i].mesh.faces) {
         // Re-pose the exact face vertices so the animated position is used.
         final posed = _pose(face.points, parts[i], anim);
         final turned = [for (final p in posed) p.rotateX(rotX).rotateY(rotY)];
         if (turned.length < 3) continue;
-        final normal =
-            _cross(_sub(turned[1], turned[0]), _sub(turned[2], turned[0]));
-        if (normal.z <= 1e-6) continue; // back face
+        final normal = _cross(
+            _sub(turned[1], turned[0]),
+            _sub(turned[2], turned[0]),
+          );
+        final mag = math.sqrt(normal.x * normal.x +
+            normal.y * normal.y + normal.z * normal.z);
+        if (mag < 1e-9) continue; // degenerate face
+        final nx = normal.x / mag;
+        final ny = normal.y / mag;
+        final nz = normal.z / mag;
+        if (nz <= 1e-6) continue; // back face
         var z = 0.0;
         for (final p in turned) {
           z += p.z;
         }
         z /= turned.length;
-        final diffuse =
-            math.max(0.0, normal.x * lx + normal.y * ly + normal.z * lz);
+        final diffuse = math.max(0.0, nx * lx + ny * ly + nz * lz);
+        final ndh = math.max(0.0, (nx * lx + ny * ly + nz * (lz + 1)) / hmag);
+        // Material-aware glint: bright steel and glass catch the light, matte
+        // wood and silicone barely do, so materials read as themselves.
+        final base = face.color;
+        final luma = (((base >> 16) & 0xFF) +
+                ((base >> 8) & 0xFF) +
+                (base & 0xFF)) /
+            (3 * 255);
+        final specular =
+            math.pow(ndh, 48).toDouble() * (.12 + .70 * luma * luma);
+        // A cool edge light, so a tool silhouette separates from the dark
+        // stage instead of dissolving into it.
+        final rim = math.pow(1 - nz.clamp(0.0, 1.0), 3).toDouble() * .30;
+        // Faces further from the camera sink a little, restoring the depth the
+        // flat painter's-algorithm fills would otherwise lose.
+        final depth = .86 + .14 * ((z / extent).clamp(-1.0, 1.0) * .5 + .5);
+        // The part that is actually moving is warmed toward amber so the eye
+        // lands on the gesture. Baked into the face colour at draw time, which
+        // means it always sits exactly on the object — never a marker floating
+        // in the empty space between two arms, and never bleeding through a
+        // part drawn in front of it. Lesson-only: artwork stays neutral.
+        final warm = showCallouts && parts[i].anim != _Anim.none
+            ? .12 + .08 * pulse
+            : 0.0;
+        final projected = [for (final p in turned) project(p)];
+        // Track projected bounds for the shadow.
+        for (final pt in projected) {
+          if (pt.dx < projMinX) projMinX = pt.dx;
+          if (pt.dx > projMaxX) projMaxX = pt.dx;
+          if (pt.dy > projMaxY) projMaxY = pt.dy;
+        }
         drawable.add(_Drawable(
-          [for (final p in turned) project(p)],
-          _shade(face.color, diffuse),
-          z,
-        ));
+            projected, _shade(face.color, diffuse, specular, rim, depth, warm), z));
       }
+    }
+
+    // Directional cast shadow: light is at (-0.42, 0.74, 0.66) -> ground
+    // projection (-0.42, 0.74). Shadow falls opposite: lower-right.
+    if (showStage && projMinX.isFinite) {
+      // A part that lifts off the counter carries its shadow with it: the blob
+      // spreads, drifts and fades as the working end rises, then tightens back
+      // up as it lands. The gesture and its shadow move as one.
+      final rest = _movingCentroid(parts, 0);
+      final now = _movingCentroid(parts, anim);
+      final lift =
+          rest == null || now == null ? 0.0 : (now.y - rest.y).clamp(0.0, .45);
+      final halfW = (projMaxX - projMinX) / 2;
+      final centerX = (projMinX + projMaxX) / 2;
+      final shadowY = projMaxY + unit * (4 + lift * 30);
+      final offsetX = unit * 8; // light from upper-left -> shadow to lower-right
+      final shadowPaint = Paint()
+        ..color = Color.fromARGB(
+            (51 * (1 - lift * 1.6)).round().clamp(0, 51), 0, 0, 0)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 14);
+      canvas.drawOval(
+        Rect.fromCenter(
+          center: Offset(centerX + offsetX, shadowY),
+          width: halfW * (2.1 + lift * 1.6),
+          height: halfW * (.6 + lift * .5),
+        ),
+        shadowPaint,
+      );
     }
 
     drawable.sort((a, b) => a.z.compareTo(b.z));
@@ -517,26 +604,27 @@ class ToolGeometry {
     }
   }
 
-  static void _drawStage(
-      Canvas canvas, Size size, Offset origin, double floor) {
-    final w = math.min(size.width, size.height) * .34;
-    const lift = 16.0;
-    canvas.drawOval(
-      Rect.fromCenter(
-          center: Offset(origin.dx, floor - lift * .2),
-          width: w * 2.1,
-          height: w * .62),
-      Paint()
-        ..color = const Color(0x33000000)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 14),
-    );
-    canvas.drawOval(
-      Rect.fromCenter(
-          center: Offset(origin.dx, floor - lift * .2),
-          width: w * 1.8,
-          height: w * .5),
-      Paint()..color = const Color(0x1AFFFFFF),
-    );
+  /// Centroid of the tool's moving parts at animation phase [t], in object
+  /// space, or null when nothing moves. Shared by the lesson focus marker and
+  /// the contact shadow, so both follow the same gesture.
+  static _V? _movingCentroid(List<_Part> parts, double t) {
+    var sx = 0.0;
+    var sy = 0.0;
+    var sz = 0.0;
+    var n = 0;
+    for (final part in parts) {
+      if (part.anim == _Anim.none) continue;
+      for (final face in part.mesh.faces) {
+        for (final p in _pose(face.points, part, t)) {
+          sx += p.x;
+          sy += p.y;
+          sz += p.z;
+          n++;
+        }
+      }
+    }
+    if (n == 0) return null;
+    return _V(sx / n, sy / n, sz / n);
   }
 
   /// A pulsing technique arc plus a target-angle marker. Driven by the same
@@ -580,14 +668,27 @@ class ToolGeometry {
     );
   }
 
-  static int _shade(int color, double diffuse) {
+  /// Four light cues plus an activity tint, in one pass: Lambert body shading,
+  /// a material-aware Blinn-Phong highlight, a cool rim light at the
+  /// silhouette, a gentle depth falloff on the faces furthest from the camera,
+  /// and [warm] pulling a moving part toward amber.
+  static int _shade(int color, double diffuse, double specular, double rim,
+      double depth, double warm) {
     final a = (color >> 24) & 0xFF;
     final r = (color >> 16) & 0xFF;
     final g = (color >> 8) & 0xFF;
     final b = color & 0xFF;
-    final f = .40 + .74 * diffuse;
-    int ch(int c) => (c * f).round().clamp(0, 255);
-    return (a << 24) | (ch(r) << 16) | (ch(g) << 8) | ch(b);
+    final f = (.34 + .66 * diffuse) * depth;
+    int ch(int c, double rimBoost) =>
+        (c * f + 255 * specular + rim * rimBoost).round().clamp(0, 255);
+    // Amber is 0xF2A65A. A zero warm leaves the band untouched.
+    int tint(int c, int amber) => warm <= 0
+        ? c
+        : (c + (amber - c) * warm).round().clamp(0, 255);
+    return (a << 24) |
+        (tint(ch(r, 120), 242) << 16) |
+        (tint(ch(g, 160), 166) << 8) |
+        tint(ch(b, 215), 90);
   }
 }
 

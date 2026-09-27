@@ -3,14 +3,25 @@ import 'detector.dart';
 
 class DetectionGate {
   final int requiredConsecutiveMatches;
+
+  /// Lowest confidence that counts as a hit. Defaults to the confirmation
+  /// threshold. A lower floor lets a second gate track moderated-confidence
+  /// proposals that a human still has to confirm.
+  final double minConfidence;
   String? _candidateId;
   int _consecutiveCount = 0;
   ToolModel? _confirmedTool;
 
-  DetectionGate({this.requiredConsecutiveMatches = 3}) {
+  DetectionGate({this.requiredConsecutiveMatches = 3, double? minConfidence})
+      : minConfidence = minConfidence ?? ToolDetector.confidenceThreshold {
     if (requiredConsecutiveMatches < 1) {
       throw ArgumentError.value(requiredConsecutiveMatches,
           'requiredConsecutiveMatches', 'Must be positive');
+    }
+    // `!(x > 0)` also rejects NaN, which would otherwise poison every compare.
+    if (!(this.minConfidence > 0) || this.minConfidence > 1) {
+      throw ArgumentError.value(
+          minConfidence, 'minConfidence', 'Must be in (0, 1]');
     }
   }
 
@@ -23,12 +34,16 @@ class DetectionGate {
   /// Evaluates an incoming detection frame.
   /// Returns confirmed ToolModel only if [requiredConsecutiveMatches] matches are verified in a row.
   ToolModel? feed(DetectionResult result) {
-    if (!result.isRecognized || result.tool == null) {
+    final tool = result.tool;
+    final confidence = result.confidence;
+    final hit = tool != null &&
+        confidence.isFinite &&
+        confidence >= minConfidence &&
+        confidence <= 1;
+    if (!hit) {
       reset();
       return null;
     }
-
-    final tool = result.tool!;
 
     if (_candidateId == tool.id) {
       _consecutiveCount++;

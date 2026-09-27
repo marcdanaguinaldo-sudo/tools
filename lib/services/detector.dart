@@ -10,11 +10,16 @@ class DetectionResult {
   final double confidence;
   final String statusMessage;
   final int processingMilliseconds;
+
+  /// True when the frame was rejected purely for being too dark, so the scanner
+  /// can light the scene instead of asking the user to find a lamp.
+  final bool autoTorchRecommended;
   const DetectionResult(
       {required this.tool,
       required this.confidence,
       required this.statusMessage,
-      this.processingMilliseconds = 0});
+      this.processingMilliseconds = 0,
+      this.autoTorchRecommended = false});
   bool get isRecognized =>
       tool != null &&
       confidence.isFinite &&
@@ -25,10 +30,24 @@ class DetectionResult {
 class ToolDetector {
   static const confidenceThreshold = .65;
 
-  /// The only tool names the bundled COCO model can actually produce. The
-  /// library is far larger, so every other tool is reached through the manual
-  /// picker instead of pretending the camera understands it.
-  static const supportedToolIds = {'knife', 'bowl'};
+  /// COCO label -> catalog tool id. The model emits COCO class names (e.g. 'scissors');
+  /// the catalogue uses stable tool ids (e.g. 'kitchen_shears'). They are different
+  /// domains, so keep the mapping explicit. Adding or renaming a tool id must update
+  /// this map, not the old supportedToolIds set.
+  static const Map<String, String> labelToToolId = {
+    'knife': 'knife',
+    'bowl': 'bowl',
+    'scissors': 'kitchen_shears',
+  };
+
+  /// Tool ids the camera can actually name, for UI copy. Derived from the mapping
+  /// so the two surfaces (detection + picker) can never drift.
+  static Set<String> get supportedToolIds => labelToToolId.values.toSet();
+
+  /// Catalogue tool-by-id, precomputed once for O(1) detection lookups.
+  static final Map<String, ToolModel> _toolsById = {
+    for (final t in kBuiltInTools) t.id: t
+  };
 
   /// Ready-state copy for the camera banner. Kept free of tool names so the
   /// banner never implies a coverage the model does not have.
@@ -39,6 +58,24 @@ class ToolDetector {
   /// apart the way a duplicated string literal did.
   static const noMatchMessage =
       'No match yet — center the tool, or pick it from the library';
+
+  /// Lowest score that still earns a guidance hint in the HUD. Below the
+  /// confirmation threshold nothing can confirm a lesson, but naming what the
+  /// model likely sees turns a dead-end 'no match' into actionable advice.
+  static const candidateFloor = .40;
+
+  /// COCO classes the camera commonly sees in a kitchen that have no lesson
+  /// mapping. Naming them keeps the HUD honest about what the model sees —
+  /// a spoon is named, never aliased to a lesson.
+  static const _kitchenNeighbors = {
+    'fork',
+    'spoon',
+    'plate',
+    'cup',
+    'wine glass',
+    'bottle',
+    'blender',
+  };
 
   /// Plain statement of how much of the library automatic recognition covers.
   static String get recognitionScopeNotice =>
@@ -79,7 +116,8 @@ class ToolDetector {
       // This release ships one known model and its embedded COCO label order.
       if (labels.length != 90 ||
           labels[48] != 'knife' ||
-          labels[50] != 'bowl') {
+          labels[50] != 'bowl' ||
+          labels[86] != 'scissors') {
         throw const FormatException(
             'Labels do not match the bundled COCO model.');
       }
@@ -132,8 +170,19 @@ class ToolDetector {
       return const DetectionResult(
           tool: null, confidence: 0, statusMessage: 'Invalid detection output');
     }
+    bool centered(List<double> box) {
+      final centerX = (box[1] + box[3]) / 2;
+      final centerY = (box[0] + box[2]) / 2;
+      return centerX >= .15 && centerX <= .85 && centerY >= .15 && centerY <= .85;
+    }
+
     ToolModel? best;
     double confidence = 0;
+    ToolModel? likely;
+    double likelyScore = 0;
+    bool likelyCentered = false;
+    String? neighbor;
+    double neighborScore = 0;
     for (var i = 0; i < count.toInt(); i++) {
       final value = classes[i];
       final score = scores[i];
@@ -142,40 +191,76 @@ class ToolDetector {
           value != value.truncateToDouble() ||
           value >= labels.length ||
           !score.isFinite ||
-          score < confidenceThreshold ||
-          score > 1 ||
-          score <= confidence) {
+          score < candidateFloor ||
+          score > 1) {
         continue;
       }
       final label = labels[value.toInt()];
-      if (!supportedToolIds.contains(label)) continue;
       if (boxes != null) {
         final box = boxes[i];
-        if (box.length != 4 ||
-            box.any((n) => !n.isFinite) ||
-            box[2] <= box[0] ||
-            box[3] <= box[1]) {
-          continue;
-        }
-        final centerX = (box[1] + box[3]) / 2;
-        final centerY = (box[0] + box[2]) / 2;
-        if (centerX < .15 || centerX > .85 || centerY < .15 || centerY > .85) {
-          continue;
-        }
+        if (box.length != 4 || box.any((n) => !n.isFinite)) continue;
+        if (box[2] <= box[0] || box[3] <= box[1]) continue;
       }
-      for (final tool in kBuiltInTools) {
-        if (tool.id == label) {
-          best = tool;
-          confidence = score;
-          break;
+      final inGuide = boxes == null || centered(boxes[i]);
+      final toolId = labelToToolId[label];
+      if (toolId == null) {
+        // The model names it, the catalogue has no lesson for it. Say so —
+        // silence here is what makes the scanner feel broken.
+        if (_kitchenNeighbors.contains(label) && score > neighborScore) {
+          neighbor = label;
+          neighborScore = score;
         }
+        continue;
+      }
+      final tool = _toolsById[toolId];
+      if (tool == null) continue;
+      if (score >= confidenceThreshold) {
+        if (inGuide) {
+          if (score > confidence) {
+            best = tool;
+            confidence = score;
+          }
+        } else if (score > likelyScore) {
+          likely = tool;
+          likelyScore = score;
+          likelyCentered = false;
+        }
+      } else if (score > likelyScore) {
+        likely = tool;
+        likelyScore = score;
+        likelyCentered = inGuide;
       }
     }
+    if (best != null) {
+      return DetectionResult(
+          tool: best,
+          confidence: confidence,
+          processingMilliseconds: processingMilliseconds,
+          statusMessage: 'Possible match: ${best.name}');
+    }
+    if (likely != null) {
+      return DetectionResult(
+          tool: null,
+          confidence: likelyScore,
+          processingMilliseconds: processingMilliseconds,
+          statusMessage: likelyCentered
+              ? 'Looks like a ${likely.name} — hold it steady to confirm'
+              : 'Looks like a ${likely.name} — move it toward the center guide');
+    }
+    if (neighbor != null) {
+      final named = neighbor[0].toUpperCase() + neighbor.substring(1);
+      return DetectionResult(
+          tool: null,
+          confidence: neighborScore,
+          processingMilliseconds: processingMilliseconds,
+          statusMessage:
+              '$named detected — not scannable yet. Choose it from the library.');
+    }
     return DetectionResult(
-        tool: best,
-        confidence: confidence,
+        tool: null,
+        confidence: 0,
         processingMilliseconds: processingMilliseconds,
-        statusMessage: best == null ? noMatchMessage : 'Possible match: ${best.name}');
+        statusMessage: noMatchMessage);
   }
 
   Future<DetectionResult> processCameraImage(CameraImage image,
@@ -251,7 +336,15 @@ DetectionResult _inferFrame(_InferenceJob job) {
         tool: null,
         confidence: 0,
         processingMilliseconds: timer.elapsedMilliseconds,
-        statusMessage: 'Too dark — improve lighting or turn on the torch');
+        statusMessage: 'Too dark — improve lighting or turn on the torch',
+        autoTorchRecommended: true);
+  }
+  if (prepared.luminance > 246) {
+    return DetectionResult(
+        tool: null,
+        confidence: 0,
+        processingMilliseconds: timer.elapsedMilliseconds,
+        statusMessage: 'Too bright — reduce glare or move out of direct light');
   }
   final interpreter = Interpreter.fromAddress(job.address, allocated: true);
   final boxes =

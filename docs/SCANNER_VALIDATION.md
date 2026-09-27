@@ -2,7 +2,8 @@
 
 The bundled model is a real COCO SSD MobileNet V1 detector, and successful
 native execution does not establish accuracy on kitchen tools. Automatic
-recognition currently covers 2 of the 39 tools in the app; everything else opens
+recognition currently covers 3 of the 39 tools in the app (`knife`, `bowl`,
+`kitchen_shears` via COCO `scissors`); everything else opens
 from the library. Treat the numbers below as claims that still need measuring.
 
 ## Device checks
@@ -40,6 +41,6 @@ Agree acceptance targets before using the results to tune thresholds.
 Decide which tools are worth scanning, then collect licensed, annotated images
 for them alongside knives, bowls, and negative scenes. Fine-tune or source a
 detector with those classes, export it against the contract in README.md, add
-the new indices to `ToolDetector.supportedToolIds` and the matching `classId`
-to each tool, then repeat native and field evaluation. Do not alias spoon to
+the new label→tool-id entries to `ToolDetector.labelToToolId` and the matching
+`classId` to each tool, then repeat native and field evaluation. Do not alias spoon to
 whisk or assign unrelated COCO indices to new tools.

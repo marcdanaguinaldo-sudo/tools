@@ -100,6 +100,21 @@ void main() {
     }
   });
 
+  test('a stroke holds at its extremes instead of passing through', () async {
+    // Mid-swing should move the tool a lot; right at the top of the stroke it
+    // should barely move, the way a demonstrated technique pauses before
+    // returning. A raw sine moves equally at both points and fails this.
+    for (final toolId in const ['knife', 'peeler', 'bowl', 'ladle']) {
+      final mid = await _render(toolId, anim: 0);
+      final midNext = await _render(toolId, anim: .05);
+      final peak = await _render(toolId, anim: .25);
+      final peakNext = await _render(toolId, anim: .30);
+      expect(_changed(mid, midNext),
+          greaterThan(3 * _changed(peak, peakNext)),
+          reason: '$toolId does not hold at the end of its stroke');
+    }
+  });
+
   test('camera drag changes the rendered image', () async {
     // rotX used to be threaded in but never drawn, so orbiting did nothing.
     // A tool whose long axis is X hides its own pitch, so a small but non-zero
