@@ -27,3 +27,4 @@ flutter:
     - assets/models/ssd_mobilenet.tflite
     - assets/models/labels.txt
     - assets/models/LICENSE-2.0.txt
+    - assets/models/MODEL_CARD.md
