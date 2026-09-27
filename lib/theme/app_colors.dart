@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../models/tool_model.dart';
+
 /// Single source of truth for the Kusina colour system.
 ///
 /// A warm, earthy kitchen palette: deep charcoal-teal grounds, toasted amber
@@ -96,11 +98,17 @@ abstract final class AppColors {
   // -----------------------------------------------------------------------
 
   /// Accent used to tint a tool card by its catalog category.
+  ///
+  /// Keyed off [ToolCategories] so a renamed or added category cannot silently
+  /// fall through to [primary] again, which is what happened when these keys
+  /// still named the old six-tool categories.
   static const Map<String, Color> categoryAccents = {
-    'Cutting & Prep': Color(0xFFD98A5F),
-    'Mixing & Emulsion': Color(0xFF8FB8E0),
-    'Handling & Grilling': Color(0xFFE8B04B),
-    'Peeling & Prep': Color(0xFF86C9A4),
+    ToolCategories.cutting: Color(0xFFE08A6E),
+    ToolCategories.measuring: Color(0xFF6FC3E8),
+    ToolCategories.mixing: Color(0xFF74D69B),
+    ToolCategories.straining: Color(0xFFB39BE8),
+    ToolCategories.cooking: Color(0xFFEF7A9C),
+    ToolCategories.misc: Color(0xFFC9A227),
   };
 
   /// Accent for [category], falling back to the primary accent.

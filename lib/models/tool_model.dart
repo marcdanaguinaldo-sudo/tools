@@ -53,8 +53,8 @@ class ToolCategories {
   static const measuring = 'Measuring';
   static const mixing = 'Mixing & Preparing';
   static const straining = 'Straining & Cleaning';
-  static const cooking = 'Cooking & Serving';
-  static const misc = 'Misc & Accessories';
+  static const cooking = 'Cooking & Serving Utensils';
+  static const misc = 'Misc / Accessories';
 
   static const ordered = [
     cutting,

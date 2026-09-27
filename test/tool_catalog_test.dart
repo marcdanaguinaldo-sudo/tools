@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:kitchen_tool_scanner/models/tool_model.dart';
 import 'package:kitchen_tool_scanner/services/tool_catalog.dart';
+import 'package:kitchen_tool_scanner/theme/app_colors.dart';
 
 void main() {
   group('ToolCatalog', () {
@@ -62,6 +63,23 @@ void main() {
 
       expect(filtered.isNotEmpty, isTrue);
       expect(filtered.first.id, 'knife');
+    });
+
+    test('every category has its own accent colour', () {
+      // These keys once named the old six-tool categories, so all four silently
+      // missed and every card fell back to AppColors.primary.
+      for (final category in ToolCategories.ordered) {
+        expect(AppColors.categoryAccents.containsKey(category), isTrue,
+            reason: '$category has no accent and would render as primary');
+        expect(AppColors.forCategory(category), isNot(AppColors.primary),
+            reason: '$category falls through to the primary accent');
+      }
+
+      final accents = ToolCategories.ordered
+          .map(AppColors.forCategory)
+          .toSet();
+      expect(accents.length, ToolCategories.ordered.length,
+          reason: 'two categories share an accent');
     });
   });
 }
